@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Library &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container">
+    <div class="library-head">
+      <h1 class="page-title">Your library</h1>
+      <div id="head-actions"></div>
+    </div>
+    <div class="tabs">
+      <button class="tab active" type="button" data-tab="history">History</button>
+      <button class="tab" type="button" data-tab="watchlater">Watch later</button>
+      <button class="tab" type="button" data-tab="liked">Liked</button>
+      <button class="tab" type="button" data-tab="playlists">Playlists</button>
+      <button class="tab" type="button" data-tab="videos">Your videos</button>
+    </div>
+    <div id="content"></div>
+    <div id="empty" class="empty" hidden></div>
+    <div class="load-more-wrap"><button id="load-more" class="btn" hidden>Load more</button></div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    if (!Auth.user) { location.href = '/login?next=' + encodeURIComponent('/library'); }
+    const me = Auth.user ? Auth.user.username : '';
+
+    const content = document.getElementById('content');
+    const empty = document.getElementById('empty');
+    const loadMore = document.getElementById('load-more');
+    const headActions = document.getElementById('head-actions');
+    let tab = 'history';
+    let offset = 0;
+    let grid = null;
+
+    function setEmpty(msg) { content.innerHTML = ''; empty.hidden = false; empty.textContent = msg; loadMore.hidden = true; headActions.innerHTML = ''; }
+
+    document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.tab === tab) return;
+      tab = b.dataset.tab;
+      document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
+      empty.hidden = true; loadMore.hidden = true; headActions.innerHTML = ''; offset = 0;
+      load(false);
+    }));
+    loadMore.addEventListener('click', () => load(true));
+
+    async function load(append) {
+      try {
+        if (tab === 'history') return loadHistory(append);
+        if (tab === 'watchlater') return loadWatchLater(append);
+        if (tab === 'liked') return loadGrid(append, `/api/users/${encodeURIComponent(me)}/liked`, { showAuthor: true }, 'No liked videos yet.');
+        if (tab === 'playlists') return loadPlaylists();
+        if (tab === 'videos') return loadGrid(append, `/api/users/${encodeURIComponent(me)}`, { showAuthor: false }, 'You haven’t uploaded anything yet.');
+      } catch (e) { setEmpty(e.message); }
+    }
+
+    function ensureGrid() {
+      if (!grid || grid.parentNode !== content) { content.innerHTML = '<div class="grid" id="lib-grid"></div>'; grid = document.getElementById('lib-grid'); }
+      return grid;
+    }
+
+    async function loadGrid(append, urlBase, opts, emptyMsg) {
+      const data = await api(urlBase + (append && offset ? `?offset=${offset}` : ''));
+      const videos = data.videos || [];
+      const g = ensureGrid();
+      if (!append) { g.innerHTML = ''; offset = 0; }
+      const visible = videos.filter(videoPassesRestriction);
+      g.insertAdjacentHTML('beforeend', visible.map(v => renderVideoCard(v, opts)).join(''));
+      offset += videos.length;
+      loadMore.hidden = !data.hasMore;
+      if (!g.children.length) setEmpty(emptyMsg); else empty.hidden = true;
+    }
+
+    async function loadHistory(append) {
+      const data = await api(`/api/me/history${append && offset ? `?offset=${offset}` : ''}`);
+      const items = data.items || [];
+      const g = ensureGrid();
+      if (!append) {
+        g.innerHTML = ''; offset = 0;
+        headActions.innerHTML = items.length || data.hasMore ? `<button class="btn btn-ghost" id="clear-hist" type="button">Clear history</button>` : '';
+        const ch = document.getElementById('clear-hist');
+        if (ch) ch.onclick = async () => { if (!confirm('Clear your entire watch history?')) return; try { await api('/api/me/history', { method: 'DELETE' }); load(false); } catch (e) { toast(e.message, 'error'); } };
+      }
+      const html = items.filter(it => videoPassesRestriction(it.video)).map(it =>
+        renderVideoCard(it.video, { progress: it.position, extraActions: `<button class="card-btn" type="button" data-rm-hist="${it.video.id}">Remove</button>` })).join('');
+      g.insertAdjacentHTML('beforeend', html);
+      offset += items.length;
+      loadMore.hidden = !data.hasMore;
+      if (!g.children.length) setEmpty('Nothing watched yet.'); else empty.hidden = true;
+    }
+
+    async function loadWatchLater(append) {
+      const data = await api(`/api/me/watch-later${append && offset ? `?offset=${offset}` : ''}`);
+      const videos = data.videos || [];
+      const g = ensureGrid();
+      if (!append) {
+        g.innerHTML = ''; offset = 0;
+        const has = videos.length || data.hasMore;
+        headActions.innerHTML = has
+          ? `<button class="btn" id="wl-play" type="button">Play all</button> <button class="btn btn-ghost" id="wl-clear" type="button">Clear all</button>`
+          : '';
+        const cl = document.getElementById('wl-clear');
+        if (cl) cl.onclick = async () => { if (!confirm('Remove everything from Watch later?')) return; try { await api('/api/me/watch-later', { method: 'DELETE' }); load(false); } catch (e) { toast(e.message, 'error'); } };
+        const pa = document.getElementById('wl-play');
+        if (pa) pa.onclick = () => {
+          const ids = [...g.querySelectorAll('.card')].map(c => Number(c.dataset.vid)).filter(Boolean);
+          if (!ids.length) return;
+          Queue.ids = ids.slice(1);
+          location.href = `/watch?v=${ids[0]}`;
+        };
+      }
+      const html = videos.filter(videoPassesRestriction).map(v =>
+        renderVideoCard(v, { watchLaterBtn: false, extraActions: `<button class="card-btn" type="button" data-rm-wl="${v.id}">Remove</button>` })).join('');
+      g.insertAdjacentHTML('beforeend', html);
+      offset += videos.length;
+      loadMore.hidden = !data.hasMore;
+      if (!g.children.length) setEmpty('Nothing saved for later yet — tap “+ Later” on any video.'); else empty.hidden = true;
+    }
+
+    async function loadPlaylists() {
+      const { playlists } = await api('/api/playlists');
+      headActions.innerHTML = `<button class="btn btn-primary" id="new-pl" type="button">New playlist</button>`;
+      document.getElementById('new-pl').onclick = async () => {
+        const title = prompt('Playlist name:');
+        if (!title || !title.trim()) return;
+        try { await api('/api/playlists', { method: 'POST', body: { title: title.trim() } }); load(false); }
+        catch (e) { toast(e.message, 'error'); }
+      };
+      loadMore.hidden = true;
+      if (!playlists.length) { content.innerHTML = ''; empty.hidden = false; empty.textContent = 'No playlists yet — create one above.'; return; }
+      empty.hidden = true;
+      content.innerHTML = `<div class="playlist-list">${playlists.map(p => `
+        <div class="playlist-row" data-pl="${p.id}">
+          <a class="playlist-link" href="/playlist?list=${p.id}"><span class="pl-icon">&#9776;</span><span><strong>${escapeHtml(p.title)}</strong><span class="form-sub"> ${pluralize(p.count, 'video')}</span></span></a>
+          <button class="btn btn-ghost btn-sm" type="button" data-del-pl="${p.id}" data-title="${escapeHtml(p.title)}">Delete</button>
+        </div>`).join('')}</div>`;
+      content.querySelectorAll('[data-del-pl]').forEach(b => b.addEventListener('click', async () => {
+        if (!confirm(`Delete the playlist “${b.dataset.title}”?`)) return;
+        try { await api(`/api/playlists/${b.dataset.delPl}`, { method: 'DELETE' }); load(false); }
+        catch (e) { toast(e.message, 'error'); }
+      }));
+    }
+
+    // remove-from-history / remove-from-watch-later (delegated)
+    content.addEventListener('click', async (e) => {
+      const bh = e.target.closest('[data-rm-hist]');
+      const bw = e.target.closest('[data-rm-wl]');
+      const b = bh || bw;
+      if (!b) return;
+      e.preventDefault();
+      const url = bh ? `/api/me/history/${bh.dataset.rmHist}` : `/api/me/watch-later/${bw.dataset.rmWl}`;
+      const emptyMsg = bh ? 'Nothing watched yet.' : 'Nothing saved for later yet — tap “+ Later” on any video.';
+      try {
+        await api(url, { method: 'DELETE' });
+        const card = b.closest('.card'); if (card) card.remove();
+        if (grid && !grid.children.length) setEmpty(emptyMsg);
+      } catch (err) { toast(err.message, 'error'); }
+    });
+
+    load(false);
+  </script>
+</body>
+</html>

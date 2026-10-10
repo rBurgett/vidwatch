@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trending &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container">
+    <h1 class="page-title">Trending</h1>
+    <p class="form-sub">Most-watched videos over the last 7 days.</p>
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" hidden></div>
+    <div class="load-more-wrap"><button id="load-more" class="btn" hidden>Load more</button></div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    (function () {
+      const grid = document.getElementById('grid');
+      const empty = document.getElementById('empty');
+      const loadMore = document.getElementById('load-more');
+      let offset = 0, shown = 0;
+
+      function url(off) {
+        const u = new URLSearchParams();
+        if (Settings.restricted) u.set('maxRating', Settings.maxRating);
+        if (off) u.set('offset', String(off));
+        const s = u.toString();
+        return '/api/trending' + (s ? '?' + s : '');
+      }
+      async function load(append) {
+        try {
+          const { videos, hasMore } = await api(url(append ? offset : 0));
+          if (!append) { grid.innerHTML = ''; offset = 0; shown = 0; }
+          const visible = videos.filter(videoPassesRestriction);
+          grid.insertAdjacentHTML('beforeend', visible.map(v => renderVideoCard(v)).join(''));
+          offset += videos.length; shown += visible.length;
+          loadMore.hidden = !hasMore;
+          if (!shown && !hasMore) { empty.hidden = false; empty.textContent = 'Nothing trending yet — check back once people start watching.'; }
+          else empty.hidden = true;
+        } catch (e) { empty.hidden = false; empty.textContent = e.message; loadMore.hidden = true; }
+      }
+      loadMore.addEventListener('click', () => load(true));
+      load(false);
+    })();
+  </script>
+</body>
+</html>

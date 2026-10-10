@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Watch &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="watch-layout" id="watch-layout">
+    <div class="player-col">
+      <div id="playlist-bar" hidden></div>
+
+      <div class="player-wrap" id="player-wrap">
+        <video id="player" controls playsinline preload="metadata"></video>
+        <div class="up-next-overlay" id="up-next" hidden></div>
+      </div>
+      <div class="player-controls" id="player-controls"></div>
+
+      <h1 class="video-title" id="title"></h1>
+      <div class="video-row">
+        <div class="video-author-wrap">
+          <a class="video-author" id="author" href="#"></a>
+          <button class="btn" id="subscribe-btn" type="button" hidden></button>
+        </div>
+        <div class="video-actions" id="video-actions"></div>
+      </div>
+      <div class="description-box" id="description"></div>
+      <div id="report-list" hidden></div>
+      <div class="edit-panel card-panel" id="edit-panel" hidden></div>
+
+      <section class="comments-section">
+        <div class="comments-head">
+          <h3 id="comments-heading">Comments</h3>
+          <div class="comment-sort" id="comment-sort"></div>
+        </div>
+        <form id="comment-form" class="comment-form" hidden>
+          <span id="me-avatar"></span>
+          <textarea id="comment-body" rows="1" placeholder="Add a comment..." required></textarea>
+          <button class="btn btn-primary" type="submit">Comment</button>
+        </form>
+        <p id="comment-signed-out" class="form-sub" hidden>
+          <a href="/login">Sign in</a> to leave a comment.
+        </p>
+        <div id="comments"></div>
+      </section>
+
+      <section class="related-section" id="related-section" hidden>
+        <h3>More videos</h3>
+        <div class="grid" id="related"></div>
+      </section>
+    </div>
+  </main>
+
+  <div class="overlay" id="shortcut-overlay" hidden></div>
+
+  <script src="/js/app.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const id = parseInt(params.get('v'), 10);
+    const listId = params.get('list');
+    const startT = parseFloat(params.get('t'));
+    if (!id) location.href = '/';
+
+    const player = document.getElementById('player');
+    let currentVideo = null, liked = false, subscribed = false, savedLater = false, related = [], reports = [];
+    let playlist = null;            // { id, title, items: [video...] }
+    let commentSort = 'new';
+    let theater = false;
+    let progressTimer = null;
+    let mounted = false;
+
+    // ---------- player prefs ----------
+    player.volume = Settings.volume;
+    player.muted = Settings.muted;
+    player.addEventListener('volumechange', () => { Settings.volume = player.volume; Settings.muted = player.muted; });
+
+    const effectiveSpeed = () => (Auth.user && Auth.user.playbackSpeed) ? Auth.user.playbackSpeed : Settings.localSpeed;
+    function applySpeed(s) {
+      s = Math.min(2, Math.max(0.5, Number(s) || 1));
+      player.playbackRate = s;
+      if (Auth.user) {
+        Auth.setUser({ ...Auth.user, playbackSpeed: s });
+        clearTimeout(applySpeed._t);
+        applySpeed._t = setTimeout(() => {
+          const f = new FormData(); f.append('playbackSpeed', String(s));
+          api('/api/users/me', { method: 'PATCH', form: f }).catch(() => {});
+        }, 700);
+      } else { Settings.localSpeed = s; }
+      renderControls();
+    }
+
+    // ---------- load ----------
+    async function loadVideo() {
+      try {
+        const data = await api(`/api/videos/${id}`);
+        currentVideo = data.video; liked = data.liked; subscribed = data.subscribed; savedLater = !!data.savedForLater;
+        related = data.related || []; reports = data.reports || [];
+        currentVideo._resume = Auth.user ? (data.resumePosition || 0) : Settings.getLocalPosition(id);
+        document.title = `${currentVideo.title} — vidwatch`;
+
+        if (Settings.restricted && RATING_RANK[currentVideo.ageRating] > RATING_RANK[Settings.maxRating]) {
+          showAgeGate();
+          return;
+        }
+        mountPlayer();
+        renderMeta();
+        renderRelated();
+        loadComments();
+        setupCommentForm();
+        if (listId) loadPlaylist();
+        Queue.consume(id); // drop this video (and anything before it) from the play queue
+      } catch (e) {
+        document.querySelector('main').innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function mountPlayer() {
+      if (mounted) return;
+      mounted = true;
+      const s = effectiveSpeed();
+      player.defaultPlaybackRate = s;
+      player.src = currentVideo.videoUrl;
+      if (currentVideo.thumbnailUrl) player.poster = currentVideo.thumbnailUrl;
+      player.playbackRate = s;
+    }
+
+    player.addEventListener('loadedmetadata', () => {
+      player.playbackRate = effectiveSpeed();
+      const fromLink = Number.isFinite(startT) && startT > 0;
+      const target = fromLink ? startT : ((currentVideo && currentVideo._resume) || 0);
+      if (target > 1 && player.duration && target < player.duration - 2) {
+        player.currentTime = target;
+        if (!fromLink && target > 5) toast('Resumed where you left off');
+      }
+      renderControls();
+    });
+
+    // ---------- meta / actions ----------
+    function renderMeta() {
+      const v = currentVideo;
+      document.getElementById('title').textContent = v.title;
+      const author = document.getElementById('author');
+      author.href = `/u/${encodeURIComponent(v.author.username)}`;
+      author.innerHTML = `${avatarFor(v.author)}<div>
+        <div class="name">${escapeHtml(v.author.username)}</div>
+        <div class="video-stats">${ratingBadge(v.ageRating)} ${v.visibility === 'unlisted' ? '<span class="tag">Unlisted</span> ' : ''}${pluralize(v.views, 'view')} &middot; ${timeAgo(v.createdAt)}${v.durationSeconds ? ' &middot; ' + fmtDuration(v.durationSeconds) : ''}</div>
+      </div>`;
+      renderActions();
+      renderDescription();
+      renderControls();
+      renderReports();
+    }
+
+    function renderActions() {
+      const v = currentVideo;
+      const isOwner = Auth.user && Auth.user.id === v.author.id;
+      const sub = document.getElementById('subscribe-btn');
+      if (Auth.user && !isOwner) {
+        sub.hidden = false;
+        sub.className = 'btn ' + (subscribed ? 'btn-ghost' : 'btn-primary');
+        sub.textContent = subscribed ? 'Saved' : 'Save & Notify';
+        sub.onclick = async () => {
+          try {
+            const r = await api(`/api/users/${encodeURIComponent(v.author.username)}/subscribe`, { method: 'POST' });
+            subscribed = r.subscribed; renderActions();
+            toast(subscribed ? `Saved ${v.author.username}` : `Removed ${v.author.username}`);
+          } catch (e) { toast(e.message, 'error'); }
+        };
+      } else { sub.hidden = true; }
+
+      const acts = document.getElementById('video-actions');
+      acts.innerHTML = `
+        <button class="btn" id="like-btn"><span id="like-icon">${liked ? '&#9829;' : '&#9825;'}</span> <span id="like-count">${(v.likes || 0).toLocaleString()}</span></button>
+        <button class="btn" id="share-btn">Share</button>
+        <button class="btn btn-ghost" id="report-btn">Report</button>
+        ${isOwner ? `<button class="btn" id="edit-btn">Edit</button><button class="btn btn-danger" id="delete-btn">Delete</button>` : ''}
+      `;
+      document.getElementById('like-btn').onclick = onLike;
+      document.getElementById('share-btn').onclick = (e) => openShareMenu(e.currentTarget);
+      document.getElementById('report-btn').onclick = onReport;
+      if (isOwner) {
+        document.getElementById('edit-btn').onclick = openEdit;
+        document.getElementById('delete-btn').onclick = onDelete;
+      }
+    }
+
+    async function onLike() {
+      if (!requireLogin()) return;
+      try {
+        const r = await api(`/api/videos/${id}/like`, { method: 'POST' });
+        liked = r.liked; currentVideo.likes = r.likes;
+        document.getElementById('like-count').textContent = r.likes.toLocaleString();
+        document.getElementById('like-icon').innerHTML = liked ? '&#9829;' : '&#9825;';
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    function openShareMenu(btn) {
+      const base = location.origin + '/watch?v=' + id;
+      const at = fmtDuration(player.currentTime) || '0:00';
+      openMenu(btn, [
+        { label: 'Copy link', onClick: async () => { await copyToClipboard(base); toast('Link copied'); } },
+        { label: `Copy link at ${at}`, onClick: async () => { await copyToClipboard(base + '&t=' + Math.floor(player.currentTime || 0)); toast('Link copied'); } },
+        null,
+        { label: savedLater ? '✓ Saved to Watch later' : 'Save to Watch later', onClick: async () => {
+          if (!requireLogin()) return;
+          try {
+            if (savedLater) { await api(`/api/me/watch-later/${id}`, { method: 'DELETE' }); savedLater = false; toast('Removed from Watch later'); }
+            else { await api('/api/me/watch-later', { method: 'POST', body: { videoId: id } }); savedLater = true; toast('Saved to Watch later'); }
+          } catch (e) { toast(e.message, 'error'); }
+        } },
+        { label: 'Add to queue', onClick: () => { if (!requireLogin()) return; Queue.add(id); toast('Added to queue'); } },
+        { label: 'Save to playlist…', onClick: () => { if (!requireLogin()) return; openPlaylistPicker(btn); } }
+      ]);
+    }
+
+    async function onReport() {
+      if (!requireLogin()) return;
+      const reason = prompt('What’s wrong with this video? (your report goes to the uploader)');
+      if (!reason || !reason.trim()) return;
+      try {
+        const r = await api(`/api/videos/${id}/report`, { method: 'POST', body: { reason: reason.trim() } });
+        toast(r.alreadyReported ? 'You’ve already reported this video' : 'Thanks — your report was sent');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function onDelete() {
+      if (!confirm('Delete this video? This cannot be undone.')) return;
+      try { await api(`/api/videos/${id}`, { method: 'DELETE' }); location.href = '/'; }
+      catch (e) { toast(e.message, 'error'); }
+    }
+
+    function openEdit() {
+      const v = currentVideo;
+      const panel = document.getElementById('edit-panel');
+      panel.hidden = false;
+      panel.innerHTML = `
+        <h3>Edit video</h3>
+        <div id="ev-error" class="form-error" hidden></div>
+        <label class="field"><span>Title</span><input id="ev-title" maxlength="120" value="${escapeHtml(v.title)}"></label>
+        <label class="field"><span>Description</span><textarea id="ev-desc" maxlength="5000">${escapeHtml(v.description || '')}</textarea></label>
+        <div class="field-row">
+          <label class="field"><span>Age rating</span><select id="ev-rating">${RATINGS.map(r => `<option${r === v.ageRating ? ' selected' : ''}>${r}</option>`).join('')}</select></label>
+          <label class="field"><span>Visibility</span><select id="ev-vis"><option value="public"${v.visibility === 'public' ? ' selected' : ''}>Public</option><option value="unlisted"${v.visibility === 'unlisted' ? ' selected' : ''}>Unlisted (link only)</option></select></label>
+        </div>
+        <label class="field"><span>Replace thumbnail (optional)</span><input id="ev-thumb" type="file" accept="image/*"></label>
+        <div class="btn-row"><button class="btn btn-primary" id="ev-save" type="button">Save</button><button class="btn btn-ghost" id="ev-cancel" type="button">Cancel</button></div>
+      `;
+      panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      document.getElementById('ev-cancel').onclick = () => { panel.hidden = true; };
+      document.getElementById('ev-save').onclick = async () => {
+        const f = new FormData();
+        f.append('title', document.getElementById('ev-title').value.trim());
+        f.append('description', document.getElementById('ev-desc').value.trim());
+        f.append('ageRating', document.getElementById('ev-rating').value);
+        f.append('visibility', document.getElementById('ev-vis').value);
+        const tf = document.getElementById('ev-thumb').files[0];
+        if (tf) f.append('thumbnail', tf);
+        try {
+          const r = await api(`/api/videos/${id}`, { method: 'PATCH', form: f });
+          currentVideo = { ...currentVideo, ...r.video };
+          panel.hidden = true;
+          renderMeta();
+          toast('Saved');
+        } catch (e) {
+          const er = document.getElementById('ev-error'); er.textContent = e.message; er.hidden = false;
+        }
+      };
+    }
+
+    // ---------- description w/ clickable timestamps ----------
+    function renderDescription() {
+      const v = currentVideo;
+      const body = v.description ? linkifyTimestamps(escapeHtml(v.description)) : '';
+      document.getElementById('description').innerHTML =
+        `<div><span class="views">${pluralize(v.views, 'view')}</span> &middot; ${timeAgo(v.createdAt)}</div>${body ? `<div class="desc-text">${body}</div>` : ''}`;
+    }
+    document.getElementById('description').addEventListener('click', (e) => {
+      const a = e.target.closest('.ts-link');
+      if (!a) return;
+      e.preventDefault();
+      const t = parseFloat(a.dataset.t);
+      if (Number.isFinite(t)) { player.currentTime = t; player.play().catch(() => {}); }
+    });
+
+    function renderReports() {
+      const el = document.getElementById('report-list');
+      if (!reports.length) { el.hidden = true; el.innerHTML = ''; return; }
+      el.hidden = false;
+      el.innerHTML = `<details class="report-box"><summary>Reports on this video (${reports.length})</summary><ul>${reports.map(r =>
+        `<li><strong>${escapeHtml(r.reporter)}</strong> <span class="when">${timeAgo(r.createdAt)}</span><div>${escapeHtml(r.reason)}</div></li>`).join('')}</ul></details>`;
+    }
+
+    // ---------- player control bar ----------
+    function renderControls() {
+      const host = document.getElementById('player-controls');
+      if (!currentVideo) { host.innerHTML = ''; return; }
+      const speeds = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+      const cur = player.playbackRate || 1;
+      host.innerHTML = `
+        <label class="ctrl">Speed
+          <select id="speed-sel">${speeds.map(s => `<option value="${s}"${Math.abs(s - cur) < 0.01 ? ' selected' : ''}>${s}×</option>`).join('')}</select>
+        </label>
+        <button class="btn btn-ghost btn-sm" type="button" id="loop-btn" aria-pressed="${player.loop}">${player.loop ? 'Loop: on' : 'Loop: off'}</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="pip-btn">Picture-in-picture</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="theater-btn" aria-pressed="${theater}">${theater ? 'Default view' : 'Theater'}</button>
+        <a class="btn btn-ghost btn-sm" href="/api/videos/${currentVideo.id}/download" download>Download</a>
+        <button class="btn btn-ghost btn-sm" type="button" id="shortcuts-btn" title="Keyboard shortcuts (?)">Shortcuts</button>
+      `;
+      document.getElementById('speed-sel').onchange = (e) => applySpeed(parseFloat(e.target.value));
+      document.getElementById('loop-btn').onclick = () => { player.loop = !player.loop; renderControls(); };
+      document.getElementById('pip-btn').onclick = togglePip;
+      document.getElementById('theater-btn').onclick = toggleTheater;
+      document.getElementById('shortcuts-btn').onclick = toggleShortcutOverlay;
+    }
+
+    function toggleFullscreen() {
+      const w = document.getElementById('player-wrap');
+      if (document.fullscreenElement) document.exitFullscreen();
+      else if (w.requestFullscreen) w.requestFullscreen();
+      else if (player.requestFullscreen) player.requestFullscreen();
+    }
+    async function togglePip() {
+      try {
+        if (document.pictureInPictureElement) await document.exitPictureInPicture();
+        else if (player.requestPictureInPicture) await player.requestPictureInPicture();
+        else toast('Picture-in-picture isn’t supported here', 'error');
+      } catch { toast('Picture-in-picture unavailable', 'error'); }
+    }
+    function toggleTheater() {
+      theater = !theater;
+      document.getElementById('watch-layout').classList.toggle('theater', theater);
+      renderControls();
+    }
+
+    // ---------- shortcut overlay ----------
+    const SHORTCUTS = [
+      ['Space / K', 'Play / pause'], ['← / →', 'Back / forward 5s'], ['J / L', 'Back / forward 10s'],
+      ['Home / End', 'Jump to start / end'], ['↑ / ↓', 'Volume up / down'], ['M', 'Mute'],
+      ['F', 'Fullscreen'], ['I', 'Picture-in-picture'], ['T', 'Theater mode'], ['> / <', 'Faster / slower'],
+      ['?', 'Show this help'], ['Esc', 'Close']
+    ];
+    function toggleShortcutOverlay(force) {
+      const el = document.getElementById('shortcut-overlay');
+      if (!el.dataset.built) {
+        el.innerHTML = `<div class="overlay-card"><h3>Keyboard shortcuts</h3><table class="shortcut-table">${SHORTCUTS.map(([k, d]) =>
+          `<tr><td><kbd>${escapeHtml(k)}</kbd></td><td>${escapeHtml(d)}</td></tr>`).join('')}</table><div class="btn-row"><button class="btn" type="button" id="sc-close">Close</button></div></div>`;
+        el.dataset.built = '1';
+        el.addEventListener('click', (e) => { if (e.target === el || e.target.id === 'sc-close') el.hidden = true; });
+      }
+      el.hidden = (force === false) ? true : (force === true ? false : !el.hidden);
+    }
+
+    // ---------- keyboard shortcuts ----------
+    document.addEventListener('keydown', (e) => {
+      const t = (e.target && e.target.tagName) || '';
+      if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || t === 'BUTTON' || t === 'A' || (e.target && e.target.isContentEditable)) {
+        if (e.key === 'Escape') toggleShortcutOverlay(false);
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const dur = player.duration || 1e9;
+      let handled = true;
+      switch (e.key) {
+        case ' ': case 'k': player.paused ? player.play().catch(() => {}) : player.pause(); break;
+        case 'ArrowLeft': player.currentTime = Math.max(0, player.currentTime - 5); break;
+        case 'ArrowRight': player.currentTime = Math.min(dur, player.currentTime + 5); break;
+        case 'j': player.currentTime = Math.max(0, player.currentTime - 10); break;
+        case 'l': player.currentTime = Math.min(dur, player.currentTime + 10); break;
+        case 'Home': player.currentTime = 0; break;
+        case 'End': if (player.duration) player.currentTime = player.duration; break;
+        case 'ArrowUp': player.volume = Math.min(1, Math.round((player.volume + 0.1) * 10) / 10); break;
+        case 'ArrowDown': player.volume = Math.max(0, Math.round((player.volume - 0.1) * 10) / 10); break;
+        case 'm': player.muted = !player.muted; break;
+        case 'f': toggleFullscreen(); break;
+        case 'i': togglePip(); break;
+        case 't': toggleTheater(); break;
+        case '>': applySpeed((player.playbackRate || 1) + 0.25); break;
+        case '<': applySpeed((player.playbackRate || 1) - 0.25); break;
+        case '?': toggleShortcutOverlay(); break;
+        case 'Escape': toggleShortcutOverlay(false); break;
+        default: handled = false;
+      }
+      if (handled) e.preventDefault();
+    });
+
+    // ---------- progress / resume ----------
+    function reportProgress(pos) {
+      if (Auth.user) api(`/api/videos/${id}/progress`, { method: 'POST', body: { position: pos } }).catch(() => {});
+      else Settings.setLocalPosition(id, pos);
+    }
+    function startProgress() {
+      stopProgress();
+      progressTimer = setInterval(() => {
+        if (player.paused || !player.duration || player.ended) return;
+        reportProgress(player.currentTime);
+      }, 5000);
+    }
+    function stopProgress() { if (progressTimer) clearInterval(progressTimer); progressTimer = null; }
+    player.addEventListener('play', startProgress);
+    player.addEventListener('pause', () => { if (player.duration && !player.ended) reportProgress(player.currentTime); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden && player.duration && !player.ended && player.currentTime > 1) reportProgress(player.currentTime); });
+    player.addEventListener('ended', () => {
+      stopProgress();
+      if (Auth.user) api(`/api/videos/${id}/progress`, { method: 'POST', body: { position: 0 } }).catch(() => {});
+      else Settings.clearLocalPosition(id);
+      maybeAutoAdvance();
+    });
+
+    // ---------- auto-advance (playlists / queue only — never from "More videos") ----------
+    function maybeAutoAdvance() {
+      if (Settings.restricted) return;
+      let nextId = null, label = '';
+      if (playlist && playlist.items.length) {
+        const i = playlist.items.findIndex(v => v.id === id);
+        if (i >= 0 && playlist.items[i + 1]) { nextId = playlist.items[i + 1].id; label = playlist.items[i + 1].title; }
+      }
+      if (!nextId && Queue.count) {
+        nextId = Queue.ids[0];
+        const m = related.find(v => v.id === nextId);
+        label = m ? m.title : 'Next in queue';
+      }
+      if (!nextId) return;
+      showUpNext(nextId, label);
+    }
+    function showUpNext(nextId, label) {
+      const el = document.getElementById('up-next');
+      let n = 5;
+      const go = () => { location.href = `/watch?v=${nextId}${playlist ? '&list=' + encodeURIComponent(playlist.id) : ''}`; };
+      el.hidden = false;
+      const draw = () => {
+        el.innerHTML = `<div class="up-next-card">
+          <div class="un-label">Up next${label ? ': ' + escapeHtml(label) : ''}</div>
+          <div class="un-count">Playing in ${n}s</div>
+          <div class="btn-row"><button class="btn" type="button" id="un-cancel">Cancel</button><button class="btn btn-primary" type="button" id="un-now">Play now</button></div>
+        </div>`;
+        document.getElementById('un-cancel').onclick = () => { clearInterval(t); el.hidden = true; };
+        document.getElementById('un-now').onclick = () => { clearInterval(t); go(); };
+      };
+      draw();
+      const t = setInterval(() => { n -= 1; if (n <= 0) { clearInterval(t); go(); } else draw(); }, 1000);
+    }
+
+    // ---------- related ----------
+    function renderRelated() {
+      const section = document.getElementById('related-section');
+      if (Settings.hideRecs) { section.hidden = true; return; }
+      const vids = related.filter(videoPassesRestriction);
+      if (!vids.length) { section.hidden = true; return; }
+      section.hidden = false;
+      document.getElementById('related').innerHTML = vids.map(v => renderVideoCard(v)).join('');
+    }
+
+    // ---------- playlist sidebar ----------
+    async function loadPlaylist() {
+      try {
+        const d = await api(`/api/playlists/${encodeURIComponent(listId)}`);
+        playlist = { id: d.playlist.id, title: d.playlist.title, items: d.items };
+        const bar = document.getElementById('playlist-bar');
+        bar.hidden = false;
+        bar.innerHTML = `<div class="pl-head"><strong>${escapeHtml(d.playlist.title)}</strong> <span class="form-sub">${pluralize(d.items.length, 'video')} &middot; by ${escapeHtml(d.playlist.owner.username)}</span> <a href="/playlist?list=${encodeURIComponent(d.playlist.id)}">Open playlist</a></div>
+          <ol class="pl-list">${d.items.map(v => `<li class="${v.id === id ? 'pl-current' : ''}"><a href="/watch?v=${v.id}&list=${encodeURIComponent(d.playlist.id)}">${escapeHtml(v.title)}</a> <span class="form-sub">${fmtDuration(v.durationSeconds) || ''}</span></li>`).join('')}</ol>`;
+      } catch { /* ignore — bad/empty list id */ }
+    }
+
+    // ---------- age gate ----------
+    function showAgeGate() {
+      document.title = `${currentVideo.title} — vidwatch`;
+      document.getElementById('player-wrap').innerHTML =
+        `<div class="age-gate"><div class="ag-rating">${escapeHtml(currentVideo.ageRating)}</div><h3>This video is rated ${escapeHtml(currentVideo.ageRating)}</h3><p>Kids mode is on, so it&rsquo;s hidden. An adult can change the limit (or turn kids mode off) in <a href="/settings">Settings</a>.</p><a class="btn" href="/">Back to home</a></div>`;
+      document.getElementById('player-controls').innerHTML = '';
+      document.getElementById('title').textContent = currentVideo.title;
+      document.getElementById('author').innerHTML = `${avatarFor(currentVideo.author)}<div><div class="name">${escapeHtml(currentVideo.author.username)}</div></div>`;
+      document.getElementById('author').href = `/u/${encodeURIComponent(currentVideo.author.username)}`;
+      document.querySelector('.comments-section').hidden = true;
+    }
+
+    // ---------- comments ----------
+    function renderCommentSort() {
+      document.getElementById('comment-sort').innerHTML =
+        `<button class="link-btn${commentSort === 'new' ? ' active' : ''}" data-csort="new">Newest</button><button class="link-btn${commentSort === 'old' ? ' active' : ''}" data-csort="old">Oldest</button>`;
+    }
+    document.getElementById('comment-sort').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-csort]'); if (!b) return;
+      commentSort = b.dataset.csort; loadComments();
+    });
+
+    async function loadComments() {
+      try {
+        const { comments } = await api(`/api/videos/${id}/comments?sort=${commentSort}`);
+        renderCommentSort();
+        const tops = comments.filter(c => !c.parentId);
+        const byParent = {};
+        comments.filter(c => c.parentId).forEach(c => { (byParent[c.parentId] = byParent[c.parentId] || []).push(c); });
+        Object.values(byParent).forEach(arr => arr.sort((a, b) => a.createdAt - b.createdAt));
+        document.getElementById('comments-heading').textContent = `${comments.length} ${comments.length === 1 ? 'comment' : 'comments'}`;
+        const host = document.getElementById('comments');
+        host.innerHTML = tops.length ? tops.map(c => commentBlock(c, byParent[c.id] || [])).join('') : '<p class="form-sub">Be the first to comment.</p>';
+      } catch { /* ignore */ }
+    }
+    function commentBlock(c, replies) {
+      return `<div class="comment-thread" data-cid="${c.id}">
+        <div class="comment">${commentRow(c, false)}</div>
+        <div class="reply-box" data-for="${c.id}" hidden></div>
+        ${replies.length ? `<div class="replies">${replies.map(r => `<div class="comment reply">${commentRow(r, true)}</div>`).join('')}</div>` : ''}
+      </div>`;
+    }
+    function commentRow(c, isReply) {
+      const isAuthor = Auth.user && Auth.user.id === c.author.id;
+      const canDelete = Auth.user && (isAuthor || (currentVideo && Auth.user.id === currentVideo.author.id));
+      return `${avatarFor(c.author)}<div class="comment-body" data-cid="${c.id}">
+        <div><a class="name" href="/u/${encodeURIComponent(c.author.username)}">${escapeHtml(c.author.username)}</a> <span class="when">${timeAgo(c.createdAt)}${c.editedAt ? ' &middot; edited' : ''}</span></div>
+        <div class="text">${escapeHtml(c.body)}</div>
+        <div class="comment-actions">
+          ${!isReply && Auth.user ? `<button class="link-btn" data-act="reply" data-cid="${c.id}">Reply</button>` : ''}
+          ${isAuthor ? `<button class="link-btn" data-act="edit" data-cid="${c.id}">Edit</button>` : ''}
+          ${canDelete ? `<button class="link-btn" data-act="del" data-cid="${c.id}">Delete</button>` : ''}
+        </div>
+      </div>`;
+    }
+    document.getElementById('comments').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-act],[data-send],[data-cancel],[data-saveedit],[data-canceledit]');
+      if (!b) return;
+      const cid = b.dataset.cid || b.dataset.send || b.dataset.cancel || b.dataset.saveedit || b.dataset.canceledit;
+      // reply box toggle
+      if (b.dataset.act === 'reply') {
+        const box = document.querySelector(`.reply-box[data-for="${cid}"]`);
+        if (!box) return;
+        if (box.dataset.open) { box.dataset.open = ''; box.hidden = true; box.innerHTML = ''; return; }
+        box.hidden = false; box.dataset.open = '1';
+        box.innerHTML = `<textarea rows="1" placeholder="Reply…"></textarea><div class="btn-row"><button class="btn btn-primary btn-sm" data-send="${cid}">Reply</button><button class="btn btn-ghost btn-sm" data-cancel="${cid}">Cancel</button></div>`;
+        box.querySelector('textarea').focus();
+        return;
+      }
+      if (b.dataset.cancel) {
+        const box = document.querySelector(`.reply-box[data-for="${cid}"]`);
+        if (box) { box.dataset.open = ''; box.hidden = true; box.innerHTML = ''; }
+        return;
+      }
+      if (b.dataset.send) {
+        const box = document.querySelector(`.reply-box[data-for="${cid}"]`);
+        const ta = box && box.querySelector('textarea');
+        const body = ta && ta.value.trim();
+        if (!body) return;
+        try { await api(`/api/videos/${id}/comments`, { method: 'POST', body: { body, parentId: cid } }); loadComments(); }
+        catch (err) { toast(err.message, 'error'); }
+        return;
+      }
+      if (b.dataset.act === 'edit') {
+        const bodyEl = b.closest('.comment-body');
+        const textEl = bodyEl.querySelector('.text');
+        if (textEl.dataset.editing) return;
+        textEl.dataset.editing = '1';
+        const old = textEl.textContent;
+        textEl.innerHTML = `<textarea rows="2">${escapeHtml(old)}</textarea><div class="btn-row"><button class="btn btn-primary btn-sm" data-saveedit="${cid}">Save</button><button class="btn btn-ghost btn-sm" data-canceledit="${cid}">Cancel</button></div>`;
+        textEl.querySelector('textarea').focus();
+        return;
+      }
+      if (b.dataset.canceledit) { loadComments(); return; }
+      if (b.dataset.saveedit) {
+        const bodyEl = b.closest('.comment-body');
+        const ta = bodyEl.querySelector('.text textarea');
+        const body = ta && ta.value.trim();
+        if (!body) return;
+        try { await api(`/api/videos/${id}/comments/${cid}`, { method: 'PATCH', body: { body } }); loadComments(); }
+        catch (err) { toast(err.message, 'error'); }
+        return;
+      }
+      if (b.dataset.act === 'del') {
+        if (!confirm('Delete this comment?')) return;
+        try { await api(`/api/videos/${id}/comments/${cid}`, { method: 'DELETE' }); loadComments(); }
+        catch (err) { toast(err.message, 'error'); }
+      }
+    });
+
+    function setupCommentForm() {
+      const form = document.getElementById('comment-form');
+      const signedOut = document.getElementById('comment-signed-out');
+      if (!Auth.user) { signedOut.hidden = false; return; }
+      form.hidden = false;
+      document.getElementById('me-avatar').innerHTML = avatarFor(Auth.user);
+      const ta = document.getElementById('comment-body');
+      ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'; });
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const body = ta.value.trim();
+        if (!body) return;
+        try { await api(`/api/videos/${id}/comments`, { method: 'POST', body: { body } }); ta.value = ''; ta.style.height = 'auto'; loadComments(); }
+        catch (err) { toast(err.message, 'error'); }
+      });
+    }
+
+    // ---------- playlist picker ----------
+    async function openPlaylistPicker(anchor) {
+      let data;
+      try { data = await api(`/api/playlists?videoId=${id}`); }
+      catch (e) { toast(e.message, 'error'); return; }
+      const items = data.playlists.map(p => ({
+        label: `${p.contains ? '✓ ' : ''}${p.title} (${p.count})`,
+        onClick: async () => {
+          try {
+            if (p.contains) { await api(`/api/playlists/${p.id}/items/${id}`, { method: 'DELETE' }); toast(`Removed from “${p.title}”`); }
+            else { await api(`/api/playlists/${p.id}/items`, { method: 'POST', body: { videoId: id } }); toast(`Added to “${p.title}”`); }
+          } catch (e) { toast(e.message, 'error'); }
+        }
+      }));
+      items.push(null);
+      items.push({
+        label: '+ New playlist…',
+        onClick: async () => {
+          const title = prompt('Playlist name:');
+          if (!title || !title.trim()) return;
+          try {
+            const r = await api('/api/playlists', { method: 'POST', body: { title: title.trim() } });
+            await api(`/api/playlists/${r.playlist.id}/items`, { method: 'POST', body: { videoId: id } });
+            toast(`Created “${r.playlist.title}” and added`);
+          } catch (e) { toast(e.message, 'error'); }
+        }
+      });
+      openMenu(anchor, items);
+    }
+
+    loadVideo();
+  </script>
+</body>
+</html>

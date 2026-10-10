@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container">
+    <div id="rows"></div>
+    <div id="controls"></div>
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" hidden></div>
+    <div class="load-more-wrap"><button id="load-more" class="btn" hidden>Load more</button></div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    (function () {
+      const params = new URLSearchParams(location.search);
+      const q = (params.get('q') || '').trim();
+      const sort = ['new', 'views', 'likes'].includes(params.get('sort')) ? params.get('sort') : 'new';
+      const mine = params.get('mine') === '1';
+      const following = params.get('following') === '1';
+
+      const grid = document.getElementById('grid');
+      const empty = document.getElementById('empty');
+      const loadMore = document.getElementById('load-more');
+      let offset = 0;       // server-side offset
+      let shown = 0;        // cards actually rendered (after kids filter)
+
+      function query(off) {
+        const u = new URLSearchParams();
+        if (q) u.set('q', q);
+        if (sort !== 'new') u.set('sort', sort);
+        if (mine) u.set('mine', '1');
+        if (following) u.set('following', '1');
+        if (Settings.restricted) u.set('maxRating', Settings.maxRating);
+        if (off) u.set('offset', String(off));
+        const s = u.toString();
+        return s ? '?' + s : '';
+      }
+      function navWith(changes) {
+        const u = new URLSearchParams(location.search);
+        for (const [k, v] of Object.entries(changes)) {
+          if (v == null || v === false || v === '' || (k === 'sort' && v === 'new')) u.delete(k);
+          else u.set(k, v === true ? '1' : v);
+        }
+        const s = u.toString();
+        location.href = '/' + (s ? '?' + s : '');
+      }
+
+      async function renderRows() {
+        const host = document.getElementById('rows');
+        if (!Auth.user || Settings.restricted || q || mine || following) return;
+        let html = '';
+        try {
+          const { items } = await api('/api/me/history');
+          const cont = items.filter(it => it.position > 5 && it.video.durationSeconds && it.position < it.video.durationSeconds - 15);
+          if (cont.length) {
+            html += `<section class="strip">
+              <div class="strip-head"><h2>Continue watching</h2><a href="/library">See all</a></div>
+              <div class="row-strip">${cont.slice(0, 12).map(it => renderVideoCard(it.video, { progress: it.position })).join('')}</div>
+            </section>`;
+          }
+        } catch { /* ignore */ }
+        try {
+          const { videos } = await api('/api/videos?following=1');
+          const vs = videos.filter(videoPassesRestriction);
+          if (vs.length) {
+            html += `<section class="strip">
+              <div class="strip-head"><h2>From creators you saved</h2><a href="/?following=1">See all</a></div>
+              <div class="row-strip">${vs.slice(0, 12).map(v => renderVideoCard(v)).join('')}</div>
+            </section>`;
+          }
+        } catch { /* ignore */ }
+        host.innerHTML = html;
+      }
+
+      function renderControls() {
+        const host = document.getElementById('controls');
+        if (Settings.restricted) {
+          host.innerHTML = `<div class="kids-banner"><strong>Kids mode is on</strong> — showing only videos rated ${escapeHtml(Settings.maxRating)} and below. Recommendations, autoplay, and search are turned off. <a href="/settings">Manage</a></div>`;
+          return;
+        }
+        const sb = (key, label) => `<button class="btn${sort === key ? ' active' : ''}" type="button" data-sort="${key}">${label}</button>`;
+        host.innerHTML = `<div class="filter-bar">
+          <div class="seg">${sb('new', 'Newest')}${sb('views', 'Most viewed')}${sb('likes', 'Most liked')}</div>
+          ${Auth.user ? `<button class="btn${mine ? ' active' : ''}" type="button" data-toggle="mine">My videos</button>
+          <button class="btn${following ? ' active' : ''}" type="button" data-toggle="following">Saved</button>` : ''}
+          ${q ? `<span class="filter-note">Results for &ldquo;${escapeHtml(q)}&rdquo;</span>` : ''}
+        </div>`;
+        host.querySelectorAll('[data-sort]').forEach(b => b.addEventListener('click', () => navWith({ sort: b.dataset.sort })));
+        host.querySelectorAll('[data-toggle]').forEach(b => b.addEventListener('click', () => navWith({ [b.dataset.toggle]: !(b.dataset.toggle === 'mine' ? mine : following) })));
+      }
+
+      async function loadPage(append) {
+        try {
+          const { videos, hasMore } = await api('/api/videos' + query(append ? offset : 0));
+          if (!append) { grid.innerHTML = ''; offset = 0; shown = 0; }
+          const visible = videos.filter(videoPassesRestriction);
+          grid.insertAdjacentHTML('beforeend', visible.map(v => renderVideoCard(v)).join(''));
+          offset += videos.length;
+          shown += visible.length;
+          loadMore.hidden = !hasMore;
+          if (!shown && !hasMore) {
+            empty.hidden = false;
+            empty.innerHTML = q ? `No videos match <strong>&ldquo;${escapeHtml(q)}&rdquo;</strong>.`
+              : mine ? `You haven&rsquo;t uploaded anything yet. <a href="/upload">Upload one!</a>`
+              : following ? `Nothing here yet — <a href="/">find creators to save</a>.`
+              : `No videos yet. ${Auth.user ? '<a href="/upload">Upload the first one!</a>' : '<a href="/register">Sign up</a> and upload the first one!'}`;
+          } else {
+            empty.hidden = true;
+          }
+        } catch (e) {
+          empty.hidden = false; empty.textContent = e.message; loadMore.hidden = true;
+        }
+      }
+
+      loadMore.addEventListener('click', () => loadPage(true));
+      renderRows();
+      renderControls();
+      loadPage(false);
+    })();
+  </script>
+</body>
+</html>

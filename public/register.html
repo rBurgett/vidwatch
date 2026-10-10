@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign up &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container-narrow">
+    <div class="card-panel">
+      <h1 class="form-title">Create your account</h1>
+      <p class="form-sub">It's free, takes 10 seconds, and lets you start uploading.</p>
+      <div id="error" class="form-error" hidden></div>
+      <form id="register-form">
+        <label class="field">
+          <span>Email</span>
+          <input id="email" name="email" type="email" autocomplete="email" required />
+        </label>
+        <label class="field">
+          <span>Username</span>
+          <input id="username" name="username" type="text" pattern="[a-zA-Z0-9_]{3,24}" title="3-24 chars: letters, numbers, underscore" required />
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required />
+        </label>
+        <button class="btn btn-primary" style="width:100%" type="submit">Create account</button>
+      </form>
+      <p class="form-foot">Already have an account? <a href="/login">Sign in</a></p>
+    </div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    if (Auth.user) location.href = '/';
+    const form = document.getElementById('register-form');
+    const error = document.getElementById('error');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      error.hidden = true;
+      const btn = form.querySelector('button[type=submit]');
+      btn.disabled = true;
+      try {
+        const { token, user } = await api('/api/auth/register', {
+          method: 'POST',
+          body: {
+            email: form.email.value.trim(),
+            username: form.username.value.trim(),
+            password: form.password.value
+          }
+        });
+        Auth.set(token, user);
+        location.href = '/';
+      } catch (err) {
+        error.textContent = err.message;
+        error.hidden = false;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

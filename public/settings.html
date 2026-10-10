@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container-narrow">
+    <h1 class="page-title">Settings</h1>
+    <p class="form-sub">These preferences live in this browser. Watch history and default speed also sync to your account when you&rsquo;re signed in.</p>
+
+    <section class="card-panel settings-section">
+      <h3>Appearance</h3>
+      <label class="field"><span>Theme</span>
+        <select id="theme-sel">
+          <option value="system">System (follow your device)</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+      <p class="form-sub">Reduced-motion is honored automatically when your device requests it.</p>
+    </section>
+
+    <section class="card-panel settings-section">
+      <h3>Kids mode</h3>
+      <label class="check"><input type="checkbox" id="restricted-chk"> <span>Turn on kids mode</span></label>
+      <label class="field" id="maxrating-field"><span>Show videos rated up to</span>
+        <select id="maxrating-sel">
+          <option value="G">G — all ages only</option>
+          <option value="PG">PG and below</option>
+          <option value="PG-13">PG-13 and below</option>
+          <option value="R">R (everything)</option>
+        </select>
+      </label>
+      <p class="form-sub">When kids mode is on, anything above the limit is hidden everywhere, the &ldquo;More videos&rdquo; list and autoplay are turned off, and the search box is hidden — so kids only see the curated home grid.</p>
+    </section>
+
+    <section class="card-panel settings-section">
+      <h3>Recommendations</h3>
+      <label class="check"><input type="checkbox" id="recsoff-chk"> <span>Hide the &ldquo;More videos&rdquo; list on watch pages</span></label>
+      <p class="form-sub">There&rsquo;s never autoplay into recommended videos — auto-advance only happens inside a playlist or your play queue.</p>
+    </section>
+
+    <section class="card-panel settings-section">
+      <h3>Playback</h3>
+      <label class="field"><span>Default playback speed</span>
+        <select id="speed-sel">
+          <option value="0.5">0.5×</option><option value="0.75">0.75×</option>
+          <option value="1">Normal</option><option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option>
+        </select>
+      </label>
+    </section>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    const themeSel = document.getElementById('theme-sel');
+    const restrictedChk = document.getElementById('restricted-chk');
+    const maxRatingSel = document.getElementById('maxrating-sel');
+    const maxRatingField = document.getElementById('maxrating-field');
+    const recsOffChk = document.getElementById('recsoff-chk');
+    const speedSel = document.getElementById('speed-sel');
+
+    themeSel.value = Settings.theme;
+    restrictedChk.checked = Settings.restricted;
+    maxRatingSel.value = Settings.maxRating;
+    recsOffChk.checked = Settings.recsOff;
+    speedSel.value = String((Auth.user && Auth.user.playbackSpeed) ? Auth.user.playbackSpeed : Settings.localSpeed);
+    maxRatingField.style.opacity = restrictedChk.checked ? '1' : '0.5';
+
+    themeSel.onchange = () => { Settings.theme = themeSel.value; refreshTopbar(); toast('Theme updated'); };
+    restrictedChk.onchange = () => {
+      Settings.restricted = restrictedChk.checked;
+      maxRatingField.style.opacity = restrictedChk.checked ? '1' : '0.5';
+      refreshTopbar();
+      toast(restrictedChk.checked ? 'Kids mode on' : 'Kids mode off');
+    };
+    maxRatingSel.onchange = () => { Settings.maxRating = maxRatingSel.value; toast(`Limit: ${maxRatingSel.value}`); };
+    recsOffChk.onchange = () => { Settings.recsOff = recsOffChk.checked; toast(recsOffChk.checked ? 'Recommendations hidden' : 'Recommendations shown'); };
+    speedSel.onchange = async () => {
+      const s = parseFloat(speedSel.value);
+      Settings.localSpeed = s;
+      if (Auth.user) {
+        Auth.setUser({ ...Auth.user, playbackSpeed: s });
+        try { const f = new FormData(); f.append('playbackSpeed', String(s)); await api('/api/users/me', { method: 'PATCH', form: f }); } catch {}
+      }
+      toast('Default speed updated');
+    };
+  </script>
+</body>
+</html>
