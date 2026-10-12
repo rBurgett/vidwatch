@@ -1,0 +1,780 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  vidwatch: static site + media on S3/CloudFront, Go API on Lambda behind API
+  Gateway, DynamoDB, and Cognito sign-in. See docs/architecture.md.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Domains }
+        Parameters: [DomainName, MediaDomainName, CertificateArn, HostedZoneId]
+      - Label: { default: API code (from the bootstrap stack) }
+        Parameters: [ArtifactsBucket, ApiCodeKey]
+      - Label: { default: Sign-in }
+        Parameters: [CognitoDomainPrefix, LocalDevOrigin]
+      - Label: { default: Uploads }
+        Parameters: [MaxUploadMB]
+    ParameterLabels:
+      DomainName: { default: Site domain }
+      MediaDomainName: { default: Media domain }
+      CertificateArn: { default: TLS certificate }
+      HostedZoneId: { default: Route 53 hosted zone }
+      ArtifactsBucket: { default: Artifacts bucket }
+      ApiCodeKey: { default: API zip key }
+      CognitoDomainPrefix: { default: Sign-in domain prefix }
+      LocalDevOrigin: { default: Local dev origin }
+      MaxUploadMB: { default: Max video size (MB) }
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: vidwatch.burgett.dev
+    Description: Where the site is served. Must be inside the hosted zone below.
+    AllowedPattern: "^[a-z0-9.-]+$"
+  MediaDomainName:
+    Type: String
+    Default: media.vidwatch.burgett.dev
+    Description: >-
+      Separate domain for uploaded videos and images, so an uploaded file can
+      never run as a page on the main site.
+    AllowedPattern: "^[a-z0-9.-]+$"
+  CertificateArn:
+    Type: String
+    Description: >-
+      ARN of an existing ACM certificate in us-east-1 that covers both domains
+      above (e.g. vidwatch.burgett.dev + *.vidwatch.burgett.dev). CloudFront
+      only accepts certificates from us-east-1.
+    AllowedPattern: "^arn:aws:acm:us-east-1:[0-9]{12}:certificate/[0-9a-f-]+$"
+    ConstraintDescription: must be an ACM certificate ARN in us-east-1
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: The Route 53 hosted zone that contains both domains (e.g. burgett.dev).
+  ArtifactsBucket:
+    Type: String
+    Description: The ArtifactsBucketName output of the vidwatch-bootstrap stack.
+    MinLength: 3
+  ApiCodeKey:
+    Type: String
+    Description: >-
+      S3 key of the API zip inside the artifacts bucket, e.g.
+      api/vidwatch-api-0123456789ab.zip (scripts/build-api.sh prints it).
+      Change this to deploy new API code.
+    AllowedPattern: "^.+\\.zip$"
+  CognitoDomainPrefix:
+    Type: String
+    Default: vidwatch-burgett
+    Description: >-
+      Sign-in pages are served at https://<prefix>.auth.us-east-1.amazoncognito.com.
+      Must be unique across all AWS accounts in the region and can't contain
+      "aws", "amazon" or "cognito".
+    AllowedPattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+  LocalDevOrigin:
+    Type: String
+    Default: http://localhost:8080
+    Description: >-
+      Origin of a locally running API + site, allowed as a sign-in callback and
+      for direct uploads to the media bucket. Leave empty to disable.
+    AllowedPattern: "^(https?://[a-z0-9.-]+(:[0-9]+)?)?$"
+  MaxUploadMB:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 5000
+    Description: Largest video upload allowed, in MB (S3 enforces it on the upload itself).
+
+Rules:
+  RequireUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref "AWS::Region", us-east-1]
+        AssertDescription: >-
+          Create this stack in us-east-1 (N. Virginia). CloudFront only accepts
+          ACM certificates from us-east-1, so the whole stack lives there.
+
+Conditions:
+  HasLocalDevOrigin: !Not [!Equals [!Ref LocalDevOrigin, ""]]
+
+Mappings:
+  Constants:
+    CloudFront:
+      # Hosted zone ID that every CloudFront alias record points at.
+      HostedZoneId: Z2FDTNDATAQYW2
+      # AWS managed policies (stable IDs).
+      CachingOptimized: 658327ea-f89d-4fab-a63d-7e88639e58f6
+      CachingDisabled: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+      AllViewerExceptHostHeader: b689b0a8-53d0-40ab-baf2-68738e2966ac
+      SecurityHeadersPolicy: 67f7725c-6f97-4210-82d7-5512b31e9d03
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Data
+  # ---------------------------------------------------------------------------
+  Table:
+    Type: AWS::DynamoDB::Table
+    # Retain: deleting or replacing the stack must never take the data with it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: LSI1SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+        - { AttributeName: GSI2PK, AttributeType: S }
+        - { AttributeName: GSI2SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      LocalSecondaryIndexes:
+        - IndexName: LSI1
+          KeySchema:
+            - { AttributeName: PK, KeyType: HASH }
+            - { AttributeName: LSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: GSI2PK, KeyType: HASH }
+            - { AttributeName: GSI2SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    # Retain: this is everyone's uploaded videos and images.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Browsers upload straight to this bucket with presigned POST forms.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST, GET, HEAD]
+            AllowedOrigins: !If
+              - HasLocalDevOrigin
+              - [!Sub "https://${DomainName}", !Ref LocalDevOrigin]
+              - [!Sub "https://${DomainName}"]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowMediaDistributionRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${MediaDistribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # Static site
+  # ---------------------------------------------------------------------------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    # Normal delete policy: the contents are rebuilt from web/ on every deploy.
+    # Empty the bucket before deleting the stack, or the delete will fail.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSiteDistributionRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+          # With ListBucket, a missing file is a 404 instead of a 403.
+          - Sid: AllowSiteDistributionList
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:ListBucket
+            Resource: !GetAtt SiteBucket.Arn
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # Shared by both distributions: CloudFront signs its requests to the private
+  # buckets; the bucket policies above only accept requests from the matching
+  # distribution.
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-s3"
+        Description: vidwatch site and media buckets
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Pretty URLs for the multi-page frontend: /watch -> /watch.html, etc.
+  # The query string lives in request.querystring, so it is left untouched.
+  SiteRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-site-rewrite"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Map extension-less page routes to their .html files
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        var PAGES = {
+          '/': '/index.html',
+          '/login': '/login.html',
+          '/register': '/register.html',
+          '/upload': '/upload.html',
+          '/watch': '/watch.html',
+          '/trending': '/trending.html',
+          '/library': '/library.html',
+          '/playlist': '/playlist.html',
+          '/settings': '/settings.html',
+          '/auth/callback': '/auth-callback.html'
+        };
+
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri.indexOf('/api/') === 0) return request;
+          if (PAGES[uri]) {
+            request.uri = PAGES[uri];
+          } else if (uri.indexOf('/u/') === 0 && uri.length > 3 && uri.indexOf('.') === -1) {
+            request.uri = '/profile.html';
+          }
+          return request;
+        }
+
+  # The managed SecurityHeadersPolicy's headers, plus Cache-Control: no-cache.
+  # The site's files keep fixed names (app.js, styles.css), so browsers must
+  # revalidate them or they could pair a stale script with fresh HTML after a
+  # deploy. Revalidation is a cheap 304. (CloudFront's own copy is refreshed by
+  # the invalidation after each upload.)
+  SiteResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-site-headers"
+        Comment: Security headers + always revalidate site files
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Preload: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: SAMEORIGIN
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          XSSProtection:
+            Protection: true
+            ModeBlock: true
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: Cache-Control
+              Value: no-cache
+              Override: true
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${DomainName} site + API"
+        Enabled: true
+        Aliases: [!Ref DomainName]
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        # No CustomErrorResponses on purpose: they apply to every behavior,
+        # so they would replace the API's 403/404 JSON errors with an HTML page.
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            # The API rejects requests without this header, so the raw
+            # execute-api URL can't be used to skip CloudFront (and spoof the
+            # CloudFront-Viewer-Address client IP).
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !FindInMap [Constants, CloudFront, CachingOptimized]
+          ResponseHeadersPolicyId: !Ref SiteResponseHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SiteRewriteFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: !FindInMap [Constants, CloudFront, CachingDisabled]
+            # Forwards everything (incl. Authorization and CloudFront-Viewer-Address)
+            # except Host, which API Gateway needs to be its own domain.
+            OriginRequestPolicyId: !FindInMap [Constants, CloudFront, AllViewerExceptHostHeader]
+            ResponseHeadersPolicyId: !FindInMap [Constants, CloudFront, SecurityHeadersPolicy]
+
+  MediaDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${MediaDomainName} uploaded media"
+        Enabled: true
+        Aliases: [!Ref MediaDomainName]
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: media
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        # Media keys are random and never overwritten, so long caching is safe.
+        # CloudFront serves byte ranges from S3, which is what video seeking needs.
+        DefaultCacheBehavior:
+          TargetOriginId: media
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !FindInMap [Constants, CloudFront, CachingOptimized]
+          ResponseHeadersPolicyId: !FindInMap [Constants, CloudFront, SecurityHeadersPolicy]
+
+  SiteRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: !FindInMap [Constants, CloudFront, HostedZoneId]
+
+  SiteRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: !FindInMap [Constants, CloudFront, HostedZoneId]
+
+  MediaRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref MediaDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt MediaDistribution.DomainName
+        HostedZoneId: !FindInMap [Constants, CloudFront, HostedZoneId]
+
+  MediaRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref MediaDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt MediaDistribution.DomainName
+        HostedZoneId: !FindInMap [Constants, CloudFront, HostedZoneId]
+
+  # ---------------------------------------------------------------------------
+  # API: HTTP API -> Go Lambda
+  # ---------------------------------------------------------------------------
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 30
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: vidwatch-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Table
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub "${Table.Arn}/index/*"
+              - Sid: MediaObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${MediaBucket.Arn}/*"
+              # Lets HeadObject on a missing key return 404 instead of 403.
+              - Sid: MediaList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt MediaBucket.Arn
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: vidwatch API (Go)
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      MemorySize: 256
+      Timeout: 20
+      Role: !GetAtt ApiFunctionRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref ApiCodeKey
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          MEDIA_BUCKET: !Ref MediaBucket
+          MEDIA_BASE_URL: !Sub "https://${MediaDomainName}"
+          COGNITO_USER_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
+          COGNITO_DOMAIN: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+          ORIGIN_VERIFY_SECRET: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+          MAX_UPLOAD_MB: !Ref MaxUploadMB
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /api/{proxy+}
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 30
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","time":"$context.requestTime","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latencyMs":"$context.responseLatency","integrationError":"$context.integrationErrorMessage"}
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # ---------------------------------------------------------------------------
+  # Cognito
+  # ---------------------------------------------------------------------------
+  PreSignUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 30
+
+  PreSignUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  # Cognito usernames allow far more than the site does; this keeps them to
+  # 3-24 letters, numbers or underscores. Managed login shows the message.
+  PreSignUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: vidwatch username rules (Cognito pre sign-up trigger)
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt PreSignUpRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PreSignUpLogGroup
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            if (!/^[A-Za-z0-9_]{3,24}$/.test(event.userName || '')) {
+              throw new Error('Username must be 3-24 characters: letters, numbers, or underscores.');
+            }
+            return event;
+          };
+
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignUpFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    # Retain: user accounts are data. Deletion protection also blocks deletes.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      # Essentials is required for managed login (v2).
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+      # Sign in with username or email; usernames ignore case.
+      AliasAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes: [email]
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      # Cognito's built-in sender is limited to a few dozen emails a day.
+      # Switch to SES (EmailSendingAccount: DEVELOPER) before real launch.
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-web"
+      UserPoolId: !Ref UserPool
+      # Public browser client: authorization code grant with PKCE, no secret.
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: !If
+        - HasLocalDevOrigin
+        - [!Sub "https://${DomainName}/auth/callback", !Sub "${LocalDevOrigin}/auth/callback"]
+        - [!Sub "https://${DomainName}/auth/callback"]
+      LogoutURLs: !If
+        - HasLocalDevOrigin
+        - [!Sub "https://${DomainName}/", !Sub "${LocalDevOrigin}/"]
+        - [!Sub "https://${DomainName}/"]
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref CognitoDomainPrefix
+      # 2 = managed login (the newer pages with the branding editor).
+      ManagedLoginVersion: 2
+
+  # Managed login needs a style assigned to the client; start from Cognito's
+  # defaults and customize later in the console's branding editor.
+  ManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn: UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref UserPoolClient
+      UseCognitoProvidedValues: true
+
+Outputs:
+  SiteUrl:
+    Value: !Sub "https://${DomainName}"
+  SiteBucketName:
+    Description: Upload the contents of web/ here.
+    Value: !Ref SiteBucket
+  SiteDistributionId:
+    Description: Invalidate this distribution after uploading a new web/.
+    Value: !Ref SiteDistribution
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  MediaDistributionId:
+    Value: !Ref MediaDistribution
+  TableName:
+    Value: !Ref Table
+  ApiFunctionName:
+    Value: !Ref ApiFunction
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+  HttpApiEndpoint:
+    Description: Direct API Gateway URL (rejects requests that don't come through CloudFront).
+    Value: !GetAtt HttpApi.ApiEndpoint
