@@ -1,69 +1,114 @@
 # vidwatch
 
-A YouTube-like video sharing app: signup/login, upload videos, browse a thumbnail grid, watch with seeking, like, comment, follow creators, build playlists, and more. Built with vanilla HTML/CSS/JS on the frontend and Node.js + Express + SQLite on the backend — no build step.
+A YouTube-like video sharing app: sign up, upload videos, browse and search, watch with seeking and resume, like, comment, follow creators, build playlists, and more.
 
-## Run locally
+It runs at **vidwatch.burgett.dev** on AWS:
 
-```bash
-npm install
-cp .env.example .env       # then edit JWT_SECRET to anything random
-npm start
-```
+- **Frontend**: static files on S3 behind CloudFront.
+- **API**: Go on Lambda behind API Gateway.
+- **Data**: DynamoDB.
+- **Sign-in**: Cognito.
+- **Media**: uploads go straight from the browser to S3 and are served from `media.vidwatch.burgett.dev`.
 
-Open http://localhost:5896 (or whatever `PORT` you set).
+The original Node/Express/SQLite version is kept on the `legacy` branch. [docs/architecture.md](docs/architecture.md) covers the design: request flow, API, DynamoDB key layout, and upload flow.
 
-### Start fresh
-
-```bash
-npm run reset
-```
-
-Deletes the local SQLite database and every uploaded video, thumbnail, and avatar — back to a clean slate. The server re-creates the DB and upload folders on the next boot. (`data/` and `uploads/` are gitignored, so this only touches your local copy.)
-
-## What's in the box
-
-- **Auth & profiles**: email/username + bcrypt-hashed password, JWT in localStorage; profile pages with avatar upload, bio, follower counts, and a "Liked videos" tab.
-- **Videos**: drag-and-drop upload (video + optional thumbnail), client-measured duration, HTML5 player with HTTP byte-range streaming, edit (title/description/thumbnail/rating/visibility), delete, and a download button.
-- **Age ratings**: every video is rated **G / PG / PG-13 / R** by its creator; the rating shows as a badge everywhere.
-- **Kids mode** (per browser): hide anything above a chosen rating across the whole site; while it's on, the "More videos" list, autoplay, and the search box are turned off, and a watch-page age gate blocks higher-rated videos.
-- **Player upgrades**: keyboard shortcuts (press `?` for the list), resume where you left off (synced to your account when signed in), playback-speed menu (remembered on your account), theater mode, picture-in-picture, loop, remembered volume.
-- **Social**: likes, threaded comments (one reply level) with edit/delete and newest/oldest sorting, follow/unfollow creators, report a video (the uploader sees reports), share menu with "copy link" and "copy link at the current time".
-- **Discovery**: search with rating/duration/date filters (press <kbd>/</kbd> anywhere to jump to the box; a recent-searches dropdown remembers your last few queries), a Trending page (most views in the last 7 days), "Continue watching" and "From creators you follow" rows on the home page, and "Load more" pagination.
-- **Watch later**: a "+ Later" button on every video thumbnail (and in the watch-page Share menu) saves to your **Watch later** list in the Library — with "Play all" and "Clear all".
-- **Playlists & queue**: create playlists, add/remove videos, "Play all" with auto-advance *within the playlist*; a session play queue with the same auto-advance. Recommendations never autoplay.
-- **Library**: a single page with your History (with resume + clear), Watch later, Liked videos, Playlists, and Your videos.
-- **Appearance**: Light / Dark / System theme toggle (per browser), and `prefers-reduced-motion` is honored automatically.
-
-## File layout
+## Layout
 
 ```
-server.js           # Express app: routes, range-streaming, multer uploads
-db.js               # SQLite schema & connection
-auth.js             # JWT sign / verify, requireAuth middleware
-scripts/reset.js    # `npm run reset` — wipe the DB + uploaded media
-public/             # Static frontend (HTML + CSS + JS, no build step)
-data/               # SQLite DB lives here (gitignored)
-uploads/            # Uploaded videos / thumbnails / avatars (gitignored)
+api/                 Go API (one binary: Lambda in AWS, plain HTTP server locally)
+  cmd/vidwatch-api/  entry point
+  cmd/devsetup/      creates the table + bucket in local emulators
+  internal/          server (HTTP), store (DynamoDB), media (S3), auth (Cognito JWTs)
+web/                 static frontend (vanilla HTML/CSS/JS, no build step)
+infra/bootstrap.yaml CloudFormation: bucket for build artifacts
+infra/vidwatch.yaml  CloudFormation: everything else
+scripts/             build-api.sh, deploy.sh
 ```
 
 ## Deploying
 
-This app is local-first and deploy-ready. To put it online:
+You need Go 1.25+ and `zip`. The AWS CLI v2 is only needed for `scripts/deploy.sh`.
 
-1. **Pick a host with a persistent disk** (small VPS, Render with a persistent disk on `/data` and `/uploads`, Fly.io with a mounted volume). Avoid ephemeral-filesystem hosts — uploads vanish on restart.
-2. **Set environment variables**:
-   - `JWT_SECRET` (required) — long random string. Generate with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`.
-   - `PORT` — usually set automatically by the host (defaults to 5896 locally).
-   - `DATA_DIR`, `UPLOADS_DIR` — point these at the persistent disk paths.
-   - `MAX_UPLOAD_MB` — defaults to 500.
-3. **Point your domain at the host** and use the host's built-in TLS (or Cloudflare/Caddy in front of a VPS) so the site is HTTPS.
-4. **Run** `npm install --omit=dev && npm start`. The server creates the DB and upload folders on first boot.
+Everything goes in **us-east-1**: CloudFront requires its certificates there, and the main template refuses to deploy anywhere else. The stack uses your existing ACM certificate for `vidwatch.burgett.dev` and `*.vidwatch.burgett.dev` (which covers `media.vidwatch.burgett.dev`); it must also be in us-east-1.
 
-## Roadmap (not built yet)
+### With the script
 
-- Recommendations beyond newest-first / trending
-- Auto-generated thumbnails (would need ffmpeg)
-- Email verification + password reset, change-password / delete-account
-- Captions / subtitles
-- Adaptive bitrate / HLS streaming for large videos
-- Move uploads to S3/R2 once disk usage matters
+```bash
+HOSTED_ZONE_ID=<burgett.dev zone id> \
+CERTIFICATE_ARN=<arn of the vidwatch.burgett.dev certificate> \
+  scripts/deploy.sh          # first time
+scripts/deploy.sh            # after that
+```
+
+It runs these steps in order:
+1. Creates or updates the bootstrap stack.
+2. Builds the API and uploads the zip.
+3. Creates or updates the `vidwatch` stack.
+4. Syncs `web/` to the site bucket.
+5. Invalidates CloudFront.
+
+### With the console
+
+1. **Bootstrap stack.** CloudFormation → Create stack → upload `infra/bootstrap.yaml`, name it `vidwatch-bootstrap`. Note the `ArtifactsBucketName` output.
+2. **API zip.** Run `scripts/build-api.sh`. Upload the zip it prints to the artifacts bucket under `api/`, so the key is `api/vidwatch-api-<hash>.zip`.
+3. **Main stack.** CloudFormation → Create stack → upload `infra/vidwatch.yaml`, name it `vidwatch`.
+   - Set **CertificateArn** (your existing ACM certificate for `vidwatch.burgett.dev` + `*.vidwatch.burgett.dev`), **HostedZoneId** (pick burgett.dev), **ArtifactsBucket** (from step 1) and **ApiCodeKey** (`api/vidwatch-api-<hash>.zip`).
+   - Leave the rest at their defaults, acknowledge IAM, and create.
+   - The first create takes several minutes, mostly CloudFront.
+4. **Site files.** Upload the *contents* of `web/` to the root of the `SiteBucketName` output.
+
+**To update:**
+- **API:** build, upload the new zip, then Update stack → use the current template → change `ApiCodeKey`.
+- **Site:** re-upload `web/`, then create a CloudFront invalidation for `/*` on `SiteDistributionId`. CloudFront tells browsers to revalidate site files, so they pick up changes right away.
+
+### Before inviting people
+
+- **Email:** Cognito's built-in email sender is limited to a few dozen messages a day (sign-up codes, password resets). Move it to SES before launch: set `EmailConfiguration` to `DEVELOPER` with a verified SES identity.
+- **Settings you can't change later:** the Cognito domain prefix (`vidwatch-burgett`) must be unused across AWS. The user pool's sign-in settings (username + email alias, case-insensitive) can't be changed after creation, so check them before the first deploy.
+- **Retained resources:** the DynamoDB table, media bucket and user pool use `DeletionPolicy: Retain` plus deletion protection. Deleting the stack leaves them behind on purpose, so remove them by hand if you ever tear everything down.
+- **Default sign-in page:** the managed login page uses Cognito's default look. Customize it in the Cognito console's branding editor.
+
+## Local development
+
+The API runs as a normal HTTP server and serves `web/` too.
+
+- **Local data:** DynamoDB Local and LocalStack (for S3), in containers.
+- **Sign-in:** goes through the real Cognito pool, which allows `http://localhost:8080/auth/callback`. So deploy the stack once first.
+
+```bash
+podman run -d --name vidwatch-ddb -p 8000:8000 amazon/dynamodb-local -jar DynamoDBLocal.jar -sharedDb
+podman run -d --name vidwatch-s3 -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4
+
+cd api
+cp .env.example .env          # then paste the Cognito IDs from the stack outputs
+go run ./cmd/devsetup         # create the table + bucket (only ever touches the emulators)
+go run ./cmd/vidwatch-api     # http://localhost:8080
+```
+
+(`docker` works the same as `podman`.)
+
+## Tests
+
+```bash
+cd api
+go test ./...                 # unit tests
+
+# Full API + browser tests against the emulators (browser tests need Chromium/Chrome on PATH):
+VIDWATCH_IT_DYNAMODB=http://127.0.0.1:8000 VIDWATCH_IT_S3=http://127.0.0.1:4566 \
+  go test -tags integration ./...
+```
+
+The integration suite runs real requests through the API, DynamoDB Local and S3:
+- uploads, including S3 rejecting a file whose type or size doesn't match what was signed
+- views, likes, comments, notifications, playlists, unlisted videos
+- cleanup when a video is deleted
+
+It also loads the main pages in headless Chromium and walks the whole sign-in flow against a fake Cognito.
+
+## Known limits / next steps
+
+- **Feeds:** search, sort by views/likes, trending and the "following" feed read every public video and filter in memory. That's fine up to a few thousand public videos; past that, add a search index.
+- **Video formats:** only MP4 and WebM are accepted. Converting other formats (MediaConvert) is a later step.
+- **Abandoned uploads:** an upload that finishes but is never attached to a video (e.g. the tab closed mid-publish) stays in S3. Add a lifecycle rule or sweeper if it adds up.
+- **Phase 2:** port `web/` to React + TypeScript + Vite.
+- **Still not built:** moderation/admin tools, captions, adaptive streaming (HLS), account deletion.

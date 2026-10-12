@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Signing in &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container-narrow">
+    <div class="card-panel">
+      <h1 class="form-title" id="heading">Signing you in&hellip;</h1>
+      <p class="form-sub" id="status">One moment.</p>
+      <div id="error" class="form-error" hidden></div>
+      <p class="form-foot" id="retry" hidden><a href="/login" id="retry-link">Try again</a></p>
+    </div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    // Cognito sends people back here with ?code=…&state=… (or ?error=…).
+    (async function () {
+      const params = new URLSearchParams(location.search);
+      let saved = null;
+      try { saved = JSON.parse(sessionStorage.getItem(OAUTH_KEY) || 'null'); } catch { /* treat as missing */ }
+      sessionStorage.removeItem(OAUTH_KEY);   // a login round trip is single-use
+      const next = safeNextPath(saved && saved.next);
+      // keep the code out of history in case someone shares the URL
+      history.replaceState(null, '', '/auth/callback');
+
+      try {
+        if (params.get('error')) {
+          const desc = params.get('error_description') || params.get('error');
+          throw new Error(params.get('error') === 'access_denied' ? 'Sign-in was cancelled.' : `Sign-in failed: ${desc}`);
+        }
+        const code = params.get('code');
+        if (!code || !saved || saved.state !== params.get('state')) {
+          throw new Error('This sign-in link has expired or was already used.');
+        }
+        await Auth.completeLogin(code, saved.verifier);
+        location.replace(next);
+      } catch (e) {
+        document.getElementById('heading').textContent = 'Couldn’t sign you in';
+        document.getElementById('status').hidden = true;
+        const error = document.getElementById('error');
+        error.textContent = e.message;
+        error.hidden = false;
+        document.getElementById('retry-link').href = '/login?next=' + encodeURIComponent(next);
+        document.getElementById('retry').hidden = false;
+        refreshTopbar();
+      }
+    })();
+  </script>
+</body>
+</html>

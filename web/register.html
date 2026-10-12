@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign up &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container-narrow">
+    <div class="card-panel">
+      <h1 class="form-title">Create your account</h1>
+      <p class="form-sub" id="status">Redirecting&hellip; On the next screen, choose <strong>Create an account</strong>.</p>
+      <div id="error" class="form-error" hidden></div>
+      <p class="form-foot" id="retry" hidden><a href="#" id="retry-link">Try again</a></p>
+    </div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    // Accounts are created on Cognito's hosted page, which shares the sign-in screen.
+    (function () {
+      const next = safeNextPath(new URLSearchParams(location.search).get('next'));
+      if (Auth.user) { location.replace(next); return; }
+      const go = () => Auth.login(next).catch((e) => {
+        document.getElementById('status').hidden = true;
+        const error = document.getElementById('error');
+        error.textContent = e.message;
+        error.hidden = false;
+        document.getElementById('retry').hidden = false;
+      });
+      document.getElementById('retry-link').addEventListener('click', (e) => { e.preventDefault(); location.reload(); });
+      // give people a moment to read where to click
+      setTimeout(go, 1200);
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in &middot; vidwatch</title>
+  <script>try{var t=localStorage.getItem('vidwatch_theme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="topbar"></div>
+  <main class="container-narrow">
+    <div class="card-panel">
+      <h1 class="form-title">Welcome back</h1>
+      <p class="form-sub" id="status">Redirecting to sign in&hellip;</p>
+      <div id="error" class="form-error" hidden></div>
+      <p class="form-foot" id="retry" hidden><a href="#" id="retry-link">Try again</a></p>
+    </div>
+  </main>
+  <script src="/js/app.js"></script>
+  <script>
+    // Sign-in itself happens on Cognito's hosted page; this just sends you there.
+    (function () {
+      const next = safeNextPath(new URLSearchParams(location.search).get('next'));
+      if (Auth.user) { location.replace(next); return; }
+      const go = () => Auth.login(next).catch((e) => {
+        document.getElementById('status').hidden = true;
+        const error = document.getElementById('error');
+        error.textContent = e.message;
+        error.hidden = false;
+        document.getElementById('retry').hidden = false;
+      });
+      document.getElementById('retry-link').addEventListener('click', (e) => { e.preventDefault(); location.reload(); });
+      go();
+    })();
+  </script>
+</body>
+</html>
